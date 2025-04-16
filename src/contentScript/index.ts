@@ -1,10 +1,7 @@
 import { computePosition, flip, offset, Rect } from "@floating-ui/dom";
 import { diffWords } from "diff";
-import type {
-  GenerateResponse,
-  GenerateRequest,
-  ListResponse,
-} from "ollama/browser";
+import type { ListResponse } from "ollama/browser";
+import { GrammarCheckResponse } from "../schema";
 
 const buttonSize = 24;
 const buttonPadding = 8;
@@ -79,46 +76,7 @@ function createDiff(str1: string, str2: string) {
 
 interface Provider {
   isSupported: () => Promise<boolean>;
-  fixGrammar: (text: string) => Promise<string>;
-}
-
-class GeminiProvider implements Provider {
-  #abortController = new AbortController();
-
-  async isSupported() {
-    try {
-      const result = await (
-        self.ai.languageModel ?? self.ai.assistant
-      ).capabilities();
-      return result.available === "readily";
-    } catch (e) {
-      console.warn(e);
-      return false;
-    }
-  }
-
-  async fixGrammar(text: string) {
-    this.#abortController.abort();
-    this.#abortController = new AbortController();
-    const session = await (self.ai.languageModel ?? self.ai.assistant).create({
-      signal: this.#abortController.signal,
-      systemPrompt: "correct grammar in text, don't add explanations",
-    });
-
-    const prompt =
-      // @prettier-ignore
-      `correct grammar:
-  ${text}
-  `;
-
-    const result = (
-      await session.prompt(prompt, { signal: this.#abortController.signal })
-    ).trim();
-
-    session.destroy();
-
-    return result;
-  }
+  fixGrammar: (text: string) => Promise<GrammarCheckResponse>;
 }
 
 class OllamaProvider implements Provider {
@@ -142,24 +100,48 @@ class OllamaProvider implements Provider {
   async fixGrammar(text: string) {
     const prompt =
       // @prettier-ignore
-      `correct grammar:
-  ${text}
-  `;
+      `Analyze the text for serious grammatical errors. Ignore minor issues like missing capitalization or punctuation.
+      
+Input text:
+-------------------
+${text.trim()}
+-------------------
 
-    const response: GenerateResponse | null = await chrome.runtime.sendMessage({
-      type: "ollama.generate",
-      data: {
-        model: "llama3.1",
-        prompt,
-        system: "correct grammar in text, don't add explanations",
-      } satisfies GenerateRequest,
-    });
+Return a JSON object with:
+- hasErrors: true if there are serious grammatical errors, false otherwise
+- correctedText: the corrected text (only if hasErrors is true)
+- errorDescription: a brief description of the error (only if hasErrors is true)`;
+
+    const response: GrammarCheckResponse | null =
+      await chrome.runtime.sendMessage({
+        type: "ollama.generate",
+        data: {
+          // good phi4
+          model: "phi4", // bad "deepseek-r1:14b",gemma3:12b
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a grammar checker. Only report serious grammatical errors. Ignore minor issues like capitalization and punctuation.",
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        },
+      });
 
     if (!response) {
       throw new Error("Make sure that Ollama is installed and running.");
     }
 
-    return response.response;
+    // Trim the corrected text if it exists
+    if (response.correctedText) {
+      response.correctedText = response.correctedText.trim();
+    }
+
+    return response;
   }
 }
 
@@ -297,7 +279,7 @@ type State =
   | { type: "empty" }
   | { type: "loading" }
   | { type: "correct" }
-  | { type: "wrong"; text: DocumentFragment }
+  | { type: "wrong"; text: DocumentFragment; errorDescription?: string }
   | { type: "error"; text: string };
 
 class Control {
@@ -305,7 +287,7 @@ class Control {
   #tooltip: Tooltip;
 
   #text: string = "";
-  #result: string = "";
+  #result: GrammarCheckResponse | null = null;
   #provider: Provider | null;
   #updateInterval: ReturnType<typeof setInterval> | null = null;
   #isVisible: boolean = false;
@@ -343,7 +325,7 @@ class Control {
   }
 
   #showTooltip() {
-    if (this.#isCorrect) {
+    if (this.#result && !this.#result.hasErrors) {
       return;
     }
     this.#tooltip.show();
@@ -386,9 +368,10 @@ class Control {
         this.#button.innerHTML = infoIcon;
         this.#tooltip.text = state.text;
         this.#tooltip.hint =
-          this.textArea instanceof HTMLTextAreaElement
+          state.errorDescription ||
+          (this.textArea instanceof HTMLTextAreaElement
             ? "Click to replace"
-            : "Click to copy";
+            : "Click to copy");
         this.#button.style.cursor = "pointer";
 
         this.#button.addEventListener("click", this.#handleWrongClick);
@@ -435,6 +418,7 @@ class Control {
     const result = await resultFromPromise(this.#provider.fixGrammar(text));
 
     if (this.#text !== text) {
+      // text has changed, so we don't need to update the result
       return;
     }
 
@@ -453,10 +437,14 @@ class Control {
 
     this.#result = result.value;
 
-    if (this.#isCorrect) {
+    if (!result.value.hasErrors) {
       this.#setState({ type: "correct" });
     } else {
-      this.#setState({ type: "wrong", text: createDiff(text, result.value) });
+      this.#setState({
+        type: "wrong",
+        text: createDiff(text, result.value.correctedText || text),
+        errorDescription: result.value.errorDescription,
+      });
     }
   }
 
@@ -491,15 +479,18 @@ class Control {
   };
 
   #handleWrongClick = async () => {
-    if (!this.#result || this.#isCorrect) {
+    if (!this.#result || !this.#result.hasErrors) {
       return;
     }
     if (this.textArea instanceof HTMLTextAreaElement) {
-      this.textArea.value = this.#result;
+      this.textArea.value = this.#result.correctedText || this.textArea.value;
       this.#hide();
     } else {
       const type = "text/plain";
-      const blob = new Blob([this.#result], { type });
+      const blob = new Blob(
+        [this.#result.correctedText || this.textArea.innerText],
+        { type },
+      );
       const data = [new ClipboardItem({ [type]: blob })];
       await navigator.clipboard.write(data);
       this.#tooltip.hint = "Copied to clipboard";
@@ -524,10 +515,6 @@ class Control {
   #hide() {
     this.#showButton = false;
     this.#updateButtonVisibility();
-  }
-
-  get #isCorrect() {
-    return this.#text === this.#result;
   }
 
   destroy() {
@@ -581,16 +568,8 @@ const focusListener = (provider: Provider | null) => async (e: Event) => {
 };
 
 const main = async () => {
-  const providers = [new OllamaProvider(), new GeminiProvider()];
-
-  let provider: Provider | null = null;
-
-  for (let p of providers) {
-    if (await p.isSupported()) {
-      provider = p;
-      break;
-    }
-  }
+  const provider = new OllamaProvider();
+  const isSupported = await provider.isSupported();
 
   const observer = new MutationObserver(() => {
     if (control?.textArea && !document.body.contains(control?.textArea)) {
@@ -600,8 +579,15 @@ const main = async () => {
   });
   observer.observe(document, { childList: true, subtree: true });
 
-  document.addEventListener("input", inputListener(provider));
-  document.addEventListener("focus", focusListener(provider), true);
+  document.addEventListener(
+    "input",
+    inputListener(isSupported ? provider : null),
+  );
+  document.addEventListener(
+    "focus",
+    focusListener(isSupported ? provider : null),
+    true,
+  );
 };
 
 main();
